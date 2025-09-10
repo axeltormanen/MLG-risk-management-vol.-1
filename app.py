@@ -3,86 +3,83 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+# Title of the app
+st.title("Stock Position Sizer App")
 
-def calculate_position_size(
-    ticker: str,
-    portfolio_eur: float,
-    exp_vol_general: int,
-    exp_vol_company: int,
-):
-    st.write(f"Pulling price data for {ticker} and QQQ...")
-    # 2 years to ensure >=201 daily returns for 200-day calc
-    data = yf.download([ticker, "QQQ"], period="2y")["Adj Close"]
+# Input fields
+ticker_symbol = st.text_input("Ticker Symbol (e.g., AAPL)", "TSLA")
+portfolio_size = st.number_input(
+    "Portfolio Size (€)", value=5000.00, step=100.00)
 
-    if data.isna().any().any():
-        data = data.dropna()
+# Volatility sliders
+general_volatility = st.slider(
+    "Expected General Volatility (0-5)", 0.0, 5.0, 2.0)
+company_volatility = st.slider(
+    "Expected Company Volatility (0-5)", 0.0, 5.0, 2.0)
 
-    if len(data) < 201 or ticker not in data.columns or "QQQ" not in data.columns:
-        st.error("Not enough historical data available for calculations.")
-        return None
+# Calculate button
+if st.button("Calculate Position Size"):
+    st.write("Pulling price data for", ticker_symbol, "and QQQ...")
 
-    returns = data.pct_change().dropna()
+    # Fetch historical data for the ticker and QQQ
+    try:
+        # Download 5 years of daily data up to today (September 10, 2025)
+        data = yf.download(ticker_symbol, start="2020-09-10", end="2025-09-10")
+        qqq_data = yf.download("QQQ", start="2020-09-10", end="2025-09-10")
 
-    # 10-day beta (use last 11 rows → 10 returns)
-    recent = returns.tail(11)
-    cov10 = np.cov(recent[ticker], recent["QQQ"])[0][1]
-    var10 = np.var(recent["QQQ"])
-    beta10 = cov10 / var10 if var10 != 0 else 0.0
-    st.write(f"10-day Beta: {beta10:.2f}")
+        # Check if enough data is available (e.g., at least 252 trading days ≈ 1 year)
+        if len(data) < 252 or len(qqq_data) < 252:
+            st.error("Not enough historical data available for calculations.")
+        else:
+            # Calculate daily returns
+            data['Daily_Return'] = data['Adj Close'].pct_change()
+            qqq_data['Daily_Return'] = qqq_data['Adj Close'].pct_change()
 
-    # 200-day beta (use last 201 rows → 200 returns)
-    long = returns.tail(201)
-    cov200 = np.cov(long[ticker], long["QQQ"])[0][1]
-    var200 = np.var(long["QQQ"])
-    beta200 = cov200 / var200 if var200 != 0 else 0.0
-    st.write(f"200-day Beta: {beta200:.2f}")
+            # Drop NA values
+            data = data.dropna()
+            qqq_data = qqq_data.dropna()
 
-    # Average beta
-    avg_beta = (beta10 + beta200) / 2
-    st.write(f"Average Beta: {avg_beta:.2f}")
+            # Calculate beta (covariance with QQQ divided by variance of QQQ)
+            covariance = data['Daily_Return'].cov(qqq_data['Daily_Return'])
+            variance = qqq_data['Daily_Return'].var()
+            beta = covariance / variance
 
-    # Beta adjustment (simple tiers)
-    if avg_beta < 1:
-        beta_adj = 0.0
-    elif 1 <= avg_beta < 1.3:
-        beta_adj = 0.5
-    else:
-        beta_adj = 1.0
+            # 20-day beta (using last 20 days)
+            beta_20 = data['Daily_Return'].tail(20).cov(
+                qqq_data['Daily_Return'].tail(20)) / variance
 
-    # Volatility adjustment from sliders (0–5 → 0–1 scale)
-    vol_adj = (exp_vol_general + exp_vol_company) / 10
+            # 200-day beta (using last 200 days)
+            beta_200 = data['Daily_Return'].tail(200).cov(
+                qqq_data['Daily_Return'].tail(200)) / variance
 
-    # Position sizing: base * (1 – blended risk)
-    risk_factor = 1 - (0.5 * beta_adj + 0.5 * vol_adj)
-    risk_factor = max(0.0, min(1.0, risk_factor))  # clamp 0..1
-    position_eur = portfolio_eur * risk_factor
-    final_pct = 100 * position_eur / portfolio_eur if portfolio_eur > 0 else 0
+            # Average beta
+            avg_beta = (beta + beta_20 + beta_200) / 3
 
-    st.success(
-        f"Recommended Position Size: €{position_eur:,.2f} ({final_pct:.1f}% of portfolio)")
-    return position_eur
+            # Position sizing based on risk factors
+            if avg_beta > 0:
+                position_size = (portfolio_size * (1 / avg_beta)) * \
+                    (general_volatility / 5) * (company_volatility / 5)
+            else:
+                # Default to 10% if beta is zero or negative
+                position_size = portfolio_size * 0.1
 
+            # Adjust position size to avoid negative or zero values
+            position_size = max(0, min(position_size, portfolio_size))
 
-# =========================
-# Streamlit UI
-# =========================
-st.title("📊 Stock Position Sizer App")
+            # Get the latest price
+            latest_price = data['Adj Close'].iloc[-1]
 
-col1, col2 = st.columns([3, 2])
-with col1:
-    ticker = st.text_input("Ticker Symbol (e.g., AAPL)",
-                           "TSLA").upper().strip()
-with col2:
-    portfolio_eur = st.number_input(
-        "Portfolio Size (€)", min_value=0.0, value=5000.0, step=100.0)
+            # Calculate number of shares
+            num_shares = position_size / latest_price
 
-exp_vol_general = st.slider("Expected General Volatility (0–5)", 0, 5, 2)
-exp_vol_company = st.slider("Expected Company Volatility (0–5)", 0, 5, 2)
+            # Display results
+            st.write(f"### Calculated Position Size")
+            st.write(f"Latest Price: €{latest_price:.2f}")
+            st.write(f"Number of Shares: {num_shares:.2f}")
+            st.write(f"Position Value: €{position_size:.2f}")
 
-if st.button("Calculate Position Size", type="primary"):
-    calculate_position_size(
-        ticker=ticker,
-        portfolio_eur=portfolio_eur,
-        exp_vol_general=exp_vol_general,
-        exp_vol_company=exp_vol_company,
-    )
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+
+# Note about data
+st.write("Note: Enough historical data is required for calculations.")
