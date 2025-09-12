@@ -3,83 +3,73 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# Title of the app
-st.title("Stock Position Sizer App")
+st.set_page_config(page_title="Stock Position Sizer App", layout="centered")
 
-# Input fields
+st.title("📊 Stock Position Sizer App")
+
+# --- Inputs ---
 ticker_symbol = st.text_input("Ticker Symbol (e.g., AAPL)", "TSLA")
 portfolio_size = st.number_input(
     "Portfolio Size (€)", value=5000.00, step=100.00)
 
-# Volatility sliders
+# Integer-only sliders (0–5)
 general_volatility = st.slider(
-    "Expected General Volatility (0-5)", 0.0, 5.0, 2.0)
+    "Expected General Volatility (0–5)", min_value=0, max_value=5, value=2, step=1)
 company_volatility = st.slider(
-    "Expected Company Volatility (0-5)", 0.0, 5.0, 2.0)
+    "Expected Company Volatility (0–5)", min_value=0, max_value=5, value=2, step=1)
 
-# Calculate button
 if st.button("Calculate Position Size"):
-    st.write("Pulling price data for", ticker_symbol, "and QQQ...")
+    st.write(f"Pulling price data for {ticker_symbol}...")
 
-    # Fetch historical data for the ticker and QQQ
     try:
-        # Download 5 years of daily data up to today (September 10, 2025)
-        data = yf.download(ticker_symbol, start="2020-09-10", end="2025-09-10")
-        qqq_data = yf.download("QQQ", start="2020-09-10", end="2025-09-10")
+        # Pull enough daily history to safely compute 10 most recent returns
+        px = yf.download(ticker_symbol, period="30d",
+                         interval="1d")["Adj Close"]
 
-        # Check if enough data is available (e.g., at least 252 trading days ≈ 1 year)
-        if len(data) < 252 or len(qqq_data) < 252:
-            st.error("Not enough historical data available for calculations.")
+        if px is None or len(px) < 11:
+            st.error(
+                "Not enough historical data available (need at least 10 trading days).")
         else:
-            # Calculate daily returns
-            data['Daily_Return'] = data['Adj Close'].pct_change()
-            qqq_data['Daily_Return'] = qqq_data['Adj Close'].pct_change()
+            # 10-day average absolute daily move (%)
+            rets = px.pct_change().dropna() * 100
+            last10 = rets.tail(10)
+            avg_abs_move = float(np.mean(np.abs(last10)))
 
-            # Drop NA values
-            data = data.dropna()
-            qqq_data = qqq_data.dropna()
+            # --- Base rule (#3) ---
+            # Start 30%, reduce 1.5% per 0.10% of avg move
+            reduction_steps = avg_abs_move / 0.10
+            base_position_pct = max(30.0 - 1.5 * reduction_steps, 0.0)
 
-            # Calculate beta (covariance with QQQ divided by variance of QQQ)
-            covariance = data['Daily_Return'].cov(qqq_data['Daily_Return'])
-            variance = qqq_data['Daily_Return'].var()
-            beta = covariance / variance
+            # --- Slider adjustments (#4) ---
+            # Each point on either slider reduces position by 3 percentage points
+            slider_reduction_pp = 3.0 * \
+                (general_volatility + company_volatility)
+            final_position_pct = max(
+                base_position_pct - slider_reduction_pp, 0.0)
 
-            # 20-day beta (using last 20 days)
-            beta_20 = data['Daily_Return'].tail(20).cov(
-                qqq_data['Daily_Return'].tail(20)) / variance
+            # € position
+            position_eur = portfolio_size * (final_position_pct / 100.0)
 
-            # 200-day beta (using last 200 days)
-            beta_200 = data['Daily_Return'].tail(200).cov(
-                qqq_data['Daily_Return'].tail(200)) / variance
+            # --- Display ---
+            st.subheader("📈 Results")
+            st.write(f"Average 10-day daily move: **{avg_abs_move:.2f}%**")
+            st.write(
+                f"Base position (from avg move): **{base_position_pct:.2f}%**")
+            st.write(f"Slider reduction: **{slider_reduction_pp:.2f} pp** "
+                     f"(3 pp × ({general_volatility} + {company_volatility}))")
+            st.write(
+                f"**Final position: {final_position_pct:.2f}% of portfolio**")
+            st.write(f"≈ **€{position_eur:,.2f}**")
 
-            # Average beta
-            avg_beta = (beta + beta_20 + beta_200) / 3
-
-            # Position sizing based on risk factors
-            if avg_beta > 0:
-                position_size = (portfolio_size * (1 / avg_beta)) * \
-                    (general_volatility / 5) * (company_volatility / 5)
-            else:
-                # Default to 10% if beta is zero or negative
-                position_size = portfolio_size * 0.1
-
-            # Adjust position size to avoid negative or zero values
-            position_size = max(0, min(position_size, portfolio_size))
-
-            # Get the latest price
-            latest_price = data['Adj Close'].iloc[-1]
-
-            # Calculate number of shares
-            num_shares = position_size / latest_price
-
-            # Display results
-            st.write(f"### Calculated Position Size")
-            st.write(f"Latest Price: €{latest_price:.2f}")
-            st.write(f"Number of Shares: {num_shares:.2f}")
-            st.write(f"Position Value: €{position_size:.2f}")
+            with st.expander("Details"):
+                st.write("Last 10 daily returns (%)")
+                st.dataframe(pd.DataFrame({"return_%": last10.round(3)}).T)
 
     except Exception as e:
         st.error(f"Error fetching data: {e}")
 
-# Note about data
-st.write("Note: Enough historical data is required for calculations.")
+st.caption(
+    "Sizing rule: start at 30% and reduce by 1.5% for each 0.10% of the 10-day average absolute daily move. "
+    "Then subtract 3 percentage points for each point of expected General and Company Volatility (0–5). "
+    "Position is floored at 0%."
+)
