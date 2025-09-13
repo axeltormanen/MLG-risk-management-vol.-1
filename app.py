@@ -1,151 +1,225 @@
-# app.py
-import time
+import datetime as dt
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import streamlit as st
 
-# ---------- Robust price fetch ----------
+# --- optional fallback if Investing.com fails
+import yfinance as yf
+
+# Investing.com via investpy
+# investpy often needs dd/mm/yyyy dates and a symbol + country lookup
+try:
+    import investpy
+    HAS_INVESTPY = True
+except Exception:
+    HAS_INVESTPY = False
 
 
-def fetch_prices_resilient(ticker: str) -> pd.Series:
-    periods = ["30d", "60d", "90d"]      # try progressively longer windows
-    tries = 3
-    for period in periods:
-        for _ in range(tries):
-            try:
-                t = yf.Ticker(ticker)
-                df = t.history(period=period, interval="1d",
-                               auto_adjust=True, actions=False, threads=False)
-                if "Close" in df and not df["Close"].empty:
-                    s = df["Close"].dropna()
-                else:
-                    raw = yf.download(ticker, period=period,
-                                      interval="1d", threads=False)
-                    s = (raw.get("Adj Close") or raw.get("Close")
-                         or pd.Series(dtype="float64")).dropna()
-                if len(s) >= 12:         # enough to compute 10d returns
-                    return s
-            except Exception:
-                time.sleep(0.8)
-                continue
-    return pd.Series(dtype="float64")
+# --------------------------
+# Data fetchers
+# --------------------------
+def fetch_prices_investing(
+    ticker: str,
+    country: str = "united states",
+    lookback_days: int = 365,
+) -> Optional[pd.Series]:
+    """
+    Try to resolve a stock on Investing.com and fetch daily Close prices.
+    Returns a pandas Series indexed by datetime, or None if anything fails.
+    """
+    if not HAS_INVESTPY:
+        return None
 
-# 10-day average absolute daily move (%)
+    try:
+        # investpy needs a search; take the first US stock match
+        results = investpy.search_quotes(
+            text=ticker,
+            products=["stocks"],
+            countries=[country],
+        )
+        if not results:
+            return None
+
+        # pick the best match (first)
+        q = results[0]
+
+        # date range must be dd/mm/yyyy
+        end = dt.date.today()
+        start = end - dt.timedelta(days=lookback_days)
+        df = q.retrieve_historical_data(
+            from_date=start.strftime("%d/%m/%Y"),
+            to_date=end.strftime("%d/%m/%Y"),
+        )
+
+        # Expect columns: Open High Low Close Volume; index is Date
+        if df is None or df.empty or "Close" not in df.columns:
+            return None
+
+        s = df["Close"].copy()
+        s.index = pd.to_datetime(s.index)
+        s = s.sort_index()
+        return s
+    except Exception:
+        # Any error (network, Cloudflare, format) -> return None
+        return None
 
 
-def ten_day_avg_abs_move(prices: pd.Series) -> float:
-    last_10 = prices.tail(10)
-    rets = last_10.pct_change().dropna()
-    if rets.empty:
-        return np.nan
-    return float(rets.abs().mean() * 100.0)
-
-# All-time beta vs QQQ (daily)
-
-
-def all_time_beta(ticker: str, index: str = "QQQ") -> float:
-    # fetch full histories (max) and align
-    s = yf.download(ticker, period="max", interval="1d",
-                    auto_adjust=True, threads=False)["Close"].dropna()
-    m = yf.download(index,  period="max", interval="1d",
-                    auto_adjust=True, threads=False)["Close"].dropna()
-    df = pd.concat([s.pct_change(), m.pct_change()], axis=1).dropna()
-    if df.shape[0] < 50:
-        return np.nan
-    cov = np.cov(df.iloc[:, 0], df.iloc[:, 1])[0, 1]
-    var_m = np.var(df.iloc[:, 1])
-    return float(cov / var_m) if var_m != 0 else np.nan
+def fetch_prices_yf(ticker: str, period: str = "2y") -> Optional[pd.Series]:
+    """
+    Yahoo fallback: Adj Close series, sorted ascending.
+    """
+    try:
+        data = yf.download(ticker, period=period,
+                           auto_adjust=False, progress=False)
+        if data is None or data.empty:
+            return None
+        if "Adj Close" in data.columns:
+            s = data["Adj Close"].copy()
+        else:
+            s = data["Close"].copy()
+        s.index = pd.to_datetime(s.index)
+        s = s.sort_index()
+        return s
+    except Exception:
+        return None
 
 
-# ---------- UI ----------
-st.set_page_config(page_title="Position Sizer", layout="centered")
-st.title("📈 Stock Position Sizer App")
+def fetch_prices_resilient(
+    ticker: str, country: str = "united states", lookback_days: int = 365
+) -> Tuple[Optional[pd.Series], str]:
+    """
+    Try Investing.com first, then Yahoo. Return (series, source_used).
+    """
+    s = fetch_prices_investing(
+        ticker, country=country, lookback_days=lookback_days)
+    if s is not None and len(s) >= 12:
+        return s, "Investing.com"
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    ticker_symbol = st.text_input(
-        "Ticker Symbol (e.g., TSLA)", value="MSFT").strip().upper()
-with col2:
-    portfolio_eur = st.number_input(
-        "Portfolio Size (€)", min_value=0.0, value=5000.0, step=100.0, format="%.2f")
+    s = fetch_prices_yf(ticker)
+    if s is not None and len(s) >= 12:
+        return s, "Yahoo Finance"
 
-method = st.selectbox(
-    "Volatility method",
-    ["10-day average absolute move (%)",
-     "All-time beta vs QQQ (excess over 1.0)"],
-    index=0
-)
+    return None, "None"
 
-general_vol = st.slider("Expected General Volatility (0–5)", 0, 5, 0)
-company_vol = st.slider("Expected Company Volatility (0–5)", 0, 5, 0)
+
+# --------------------------
+# Calculations
+# --------------------------
+def avg_abs_move_pct(closes: pd.Series, window: int = 10) -> Optional[float]:
+    """
+    10-day average absolute daily % move.
+    Needs at least window+1 closes (i.e., 11).
+    """
+    if closes is None or len(closes) < window + 1:
+        return None
+    recent = closes.tail(window + 1).pct_change().dropna() * 100.0
+    return float(recent.abs().mean())
+
+
+def position_pct_from_rule(
+    avg_move_pct: float,
+    general_vol: int,
+    company_vol: int,
+    base_pct: float = 30.0,
+    per_step_reduce: float = 1.5,
+    step_pct: float = 0.10,
+    vol_penalty_per_point: float = 3.0,
+) -> Tuple[float, float, float]:
+    """
+    Rule:
+      - Start at 30% of portfolio
+      - For every 0.10% of the 10-day average absolute move, reduce by 1.5%
+      - Apply sliders: each point (0..5) reduces an additional 3%
+      - Floor at 0%, then clamp [0, 100]
+    Returns: (final_pct, reduction_from_move, reduction_from_sliders)
+    """
+    # reduction due to 10-day average absolute move
+    reduction_from_move = per_step_reduce * (avg_move_pct / step_pct)
+
+    # sliders total penalty
+    reduction_from_sliders = vol_penalty_per_point * \
+        (general_vol + company_vol)
+
+    final_pct = base_pct - reduction_from_move - reduction_from_sliders
+    final_pct = max(0.0, min(100.0, final_pct))
+    return final_pct, reduction_from_move, reduction_from_sliders
+
+
+# --------------------------
+# Streamlit UI
+# --------------------------
+st.set_page_config(page_title="Stock Position Sizer App",
+                   page_icon="📊", layout="centered")
+st.title("📊 Stock Position Sizer App")
+
+with st.expander("How this works", expanded=False):
+    st.write(
+        """
+**Sizing rule:**
+- Start at **30%** of portfolio  
+- For **every 0.10%** of the 10-day **average absolute daily move**, **reduce by 1.5%**  
+- Apply the sliders (0–5): each point reduces the position by **3%**  
+- Final position is floored at **0%**  
+        """
+    )
+    st.caption(
+        "The app first tries **Investing.com** (via `investpy`). If that fails (e.g., blocked on Streamlit Cloud), it "
+        "falls back to **Yahoo Finance** automatically."
+    )
+
+colA, colB = st.columns([1.2, 1])
+ticker_symbol = colA.text_input("Ticker Symbol (e.g., MSFT)", value="MSFT")
+portfolio_size = colB.number_input(
+    "Portfolio Size (€)", min_value=0.0, value=5000.0, step=100.0, format="%.2f")
+
+# Integer sliders 0..5 only
+general_vol = st.slider("Expected General Volatility (0–5)",
+                        min_value=0, max_value=5, value=2, step=1)
+company_vol = st.slider("Expected Company Volatility (0–5)",
+                        min_value=0, max_value=5, value=2, step=1)
 
 if st.button("Calculate Position Size"):
-    if not ticker_symbol:
-        st.error("Please enter a ticker.")
-        st.stop()
+    st.write(f"Pulling price data for **{ticker_symbol}**…")
 
-    st.info(f"Pulling price data for **{ticker_symbol}**…")
-    prices = fetch_prices_resilient(ticker_symbol)
-
-    if prices.empty or len(prices) < 12:
-        st.error(
-            "Not enough historical data available (need at least 10 trading days).")
+    prices, used_source = fetch_prices_resilient(ticker_symbol.strip().upper())
+    if prices is None or len(prices) < 11:
+        st.error("Not enough historical data available (need at least 11 closes).")
         st.caption(
-            "Tip: use the proper exchange suffix (e.g., SHOP.TO, AIR.PA, INFY.NS) or try another symbol.")
-        st.stop()
-
-    # --- compute driving metric
-    logs = []
-    if method.startswith("10-day"):
-        avg_move_pct = ten_day_avg_abs_move(prices)  # % per day
-        if np.isnan(avg_move_pct):
-            st.error("Could not compute 10-day average move.")
-            st.stop()
-        vol_metric = avg_move_pct
-        logs.append(f"10-day average absolute move: **{avg_move_pct:.2f}%**")
-    else:
-        beta = all_time_beta(ticker_symbol, "QQQ")
-        if np.isnan(beta):
-            st.error("Could not compute all-time beta.")
-            st.stop()
-        excess_beta = max(0.0, beta - 1.0)
-        # Use the same 0.10 “step” rule but on **excess beta** (keeps result reasonable)
-        vol_metric = excess_beta  # in beta units
-        logs.append(
-            f"All-time beta vs QQQ: **{beta:.2f}** (excess over 1.0 = {excess_beta:.2f})")
-
-    # --- sizing rule
-    base_pct = 30.0  # start at 30% of portfolio
-
-    if method.startswith("10-day"):
-        # per your spec: every 0.10% avg move reduces by 1.5%
-        reduction_from_metric = 1.5 * (vol_metric / 0.10)
-    else:
-        # alternate: every 0.10 of **excess beta** reduces by 1.5%
-        reduction_from_metric = 1.5 * (vol_metric / 0.10)
-
-    # news adjustments: each point 0–5 subtracts 3%
-    news_adjust = 3.0 * (general_vol + company_vol)
-
-    final_pct = max(0.0, base_pct - reduction_from_metric - news_adjust)
-    final_eur = final_pct/100.0 * portfolio_eur
-
-    st.subheader("Result")
-    st.write(
-        f"**Recommended position:** **€{final_eur:,.2f}**  (_{final_pct:.2f}% of portfolio_)")
-
-    with st.expander("Details"):
-        st.markdown(
-            f"""
-- Base: **{base_pct:.1f}%**
-- Reduction from {'10-day move' if method.startswith('10-day') else 'excess beta'}: **{reduction_from_metric:.2f}%**
-- News adjustments (general + company = {general_vol}+{company_vol}): **{news_adjust:.2f}%**
-- Final: **{final_pct:.2f}%**
-            """
+            "Tip: For US stocks, try the plain ticker (e.g., AAPL, MSFT). If Investing.com is blocked, the app will try Yahoo automatically. "
+            "If a regional suffix is needed on Yahoo (e.g., `.L`, `.MX`), include it."
         )
-        for L in logs:
-            st.write("•", L)
+    else:
+        avg_move = avg_abs_move_pct(prices, window=10)
+        if avg_move is None:
+            st.error("Could not compute 10-day average absolute move.")
+        else:
+            final_pct, red_move, red_sliders = position_pct_from_rule(
+                avg_move_pct=avg_move,
+                general_vol=general_vol,
+                company_vol=company_vol,
+            )
 
-st.caption("Sizing rule: start at 30%. Reduce 1.5% per 0.10 step (either 0.10% of 10-day avg move, or 0.10 excess beta). "
-           "Subtract 3% per point of expected General and Company Volatility (0–5). Floor at 0%.")
+            st.success(
+                f"**Source:** {used_source}  \n"
+                f"**10-day average absolute move:** {avg_move:.2f}%  \n"
+                f"**Position size:** **{final_pct:.2f}%** of portfolio  \n"
+            )
+
+            # Convert to currency
+            pos_eur = portfolio_size * (final_pct / 100.0)
+            st.write(f"**Position €:** {pos_eur:,.2f}")
+
+            with st.expander("Calculation details"):
+                st.write(
+                    f"- Base: 30.00%  \n"
+                    f"- Reduction from average move: −{red_move:.2f}%  \n"
+                    f"- Reduction from sliders (3% × (general + company)): −{red_sliders:.2f}%  \n"
+                    f"- **Final:** {final_pct:.2f}%"
+                )
+
+st.caption(
+    "Note: If you consistently see data errors on Streamlit Cloud, it’s likely Investing.com is blocked. "
+    "The app already falls back to Yahoo; if your ticker needs a suffix on Yahoo (e.g., `VOD.L`), please include it."
+)
